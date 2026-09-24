@@ -6,6 +6,9 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "pandas",
+    "transformers>=4.57.6",
+    "timm",
+    "safetensors",
     # One automatic choice per platform, no user decision needed:
     #   - Windows/Linux: CUDA-capable build (falls back to CPU at runtime)
     #   - macOS: CPU build (onnxruntime-gpu ships no macOS wheels)

@@ -11,9 +11,11 @@ from typing_extensions import override
 from comfy import utils
 import pandas as pd
 import json
+import re
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from contextlib import nullcontext
 
 config = get_extension_config()
 known_models = list(config.get("model_url", {}).keys())
@@ -202,6 +204,20 @@ def _prep_pixai(images, height, width):
     return x.sub(0.5).div(0.5).detach().cpu().numpy()
 
 
+def _prep_pixai_v1(images, size=1008):
+    """Match PixAI v1's resize, black padding and [-1, 1] normalization."""
+    x = _to_nchw(images)
+    h, w = x.shape[-2:]
+    if (h, w) != (size, size):
+        scale = min(size / h, size / w)
+        nh, nw = int(h * scale), int(w * scale)
+        x = transforms.functional.resize(x, [nh, nw])
+        ph, pw = size - nh, size - nw
+        x = transforms.functional.pad(x, [pw // 2, ph // 2,
+                                          pw - pw // 2, ph - ph // 2], 0)
+    return x.sub(0.5).div(0.5)
+
+
 def _prep_camie(images, height, width):
     """Camie: [B, 3, H, W] ImageNet-normalised on its signature grey canvas."""
     x = _to_nchw(images)
@@ -253,7 +269,8 @@ def _prep_animetimm(images, pad_size, resize_size, crop_size, mean, std):
     x = _to_nchw(images)
     b, _, h, w = x.shape
     if h < pad_size[0] or w < pad_size[1]:
-        x = F.pad(x, (0, max(0, pad_size[1] - w), 0, max(0, pad_size[0] - h)), value=1.0)
+        ph, pw = max(0, pad_size[0] - h), max(0, pad_size[1] - w)
+        x = F.pad(x, (pw // 2, pw - pw // 2, ph // 2, ph - ph // 2), value=1.0)
     x = F.interpolate(x, size=tuple(resize_size), mode="bicubic",
                       align_corners=False, antialias=True)
     # torchvision's CenterCrop rounds the crop origin up; match it exactly.
@@ -408,12 +425,20 @@ def _load_animetimm_preprocess(model_name: str) -> dict:
     """Load the per-model preprocess.json from its model subdirectory."""
     path = os.path.join(models_dir, config["preprocess_path"][model_name])
     if not os.path.exists(path):
-        log(f"No preprocess.json found for {model_name}, using fallback", "WARN", True)
+        # The official ConvNeXtV2 Huge repository gates preprocess.json, while
+        # its model card publishes these exact test transforms. The ONNX model
+        # itself and selected_tags.csv are available from public repositories.
+        if model_name == "animetimm-convnextv2_huge-dbv4-full":
+            size = 512
+            log(f"Using published preprocessing for {model_name}", "INFO", True)
+        else:
+            size = 448
+            log(f"No preprocess.json found for {model_name}, using fallback", "WARN", True)
         return {
             "test": [
                 {"type": "pad_to_size", "size": [512, 512]},
-                {"type": "resize", "size": [448, 448]},
-                {"type": "center_crop", "size": [448, 448]},
+                {"type": "resize", "size": [size, size]},
+                {"type": "center_crop", "size": [size, size]},
                 {"type": "normalize", "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]}
             ]
         }
@@ -466,6 +491,24 @@ def cl_tagger_v1_tag_batch(cl_model: InferenceSession, images: list[Image.Image]
 # numpy indexing and string joins, with no per-image pandas work.
 # ---------------------------------------------------------------------------
 
+def _category_names(df):
+    """Keep source categories distinct even when they share an output group."""
+    fallback = {0: "general", 1: "rating", 2: "quality", 3: "meta", 4: "character", 9: "rating"}
+    if "category_name" in df.columns:
+        return np.asarray([str(name).strip().lower() for name in df["category_name"]], dtype=object)
+    return np.asarray([fallback.get(int(value), "general") for value in df["category"]], dtype=object)
+
+
+def _category_group(name, recommendations=None):
+    if name == "rating":
+        return "rating"
+    if name == "quality" and "quality" not in (recommendations or {}):
+        return "excluded"
+    if name in {"character", "copyright", "artist"}:
+        return "character"
+    return "general"
+
+
 class ModelSpec:
     """A loaded session bound to its preprocessing and precomputed tag tables.
 
@@ -477,31 +520,42 @@ class ModelSpec:
         self.sess = sess
         self.model_name = model_name
         self.preprocess = preprocess
-        self.prep = prep              # callable(_to_nchw(tensor)) -> model input array
-        self.run_mode = run_mode      # "plain" | "camie" | "animetimm" | "sigmoid"
-        img_input = sess.get_inputs()[0]
-        self.in_name = img_input.name
-        self.out_names = [o.name for o in sess.get_outputs()]
+        self.prep = prep              # callable(_to_nchw(tensor)) -> model input
+        self.run_mode = run_mode      # "plain" | "camie" | "animetimm" | "sigmoid" | "torch"
+        if run_mode == "torch":
+            self.in_name = None
+            self.out_names = []
+        else:
+            img_input = sess.get_inputs()[0]
+            self.in_name = img_input.name
+            self.out_names = [o.name for o in sess.get_outputs()]
 
-        categories = df["category"].to_numpy() if "category" in df.columns \
-            else np.zeros(len(df), dtype=np.int64)
+        category_names = _category_names(df)
+        recommendations = config["category_thresholds"].get(model_name, {})
+        groups = np.asarray(
+            [_category_group(name, recommendations) for name in category_names], dtype=object)
         self.tags = {
-            name: np.flatnonzero(categories == cat)
-            for name, cat in (("general", 0), ("character", 4), ("rating", 1))
+            name: np.flatnonzero(groups == name)
+            for name in ("general", "character", "rating")
         }
+        self.recommended_threshold = np.asarray(
+            [recommendations.get(name, 0.0) for name in category_names], dtype=np.float32)
         raw = df["name"].to_numpy(dtype=object)
         self.raw_names = np.asarray(raw, dtype=object)
         # Pre-escape so _format_tags never rebuilds the same strings per image.
         self.escaped_names = np.asarray(
             [str(n).replace("(", "\\(").replace(")", "\\)") for n in raw], dtype=object)
         self.best_threshold = np.nan_to_num(
-            df["best_threshold"].to_numpy(dtype=np.float32), nan=1.0, posinf=1.0, neginf=1.0) \
+            df["best_threshold"].to_numpy(dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0) \
             if "best_threshold" in df.columns else None
 
     def prepare_batch(self, images) -> np.ndarray:
         return self._run(self.prep(_to_nchw(images)))
 
     def prepare_pil_batch(self, images) -> np.ndarray:
+        if self.run_mode == "torch":
+            tensors = torch.stack([transforms.ToTensor()(img.convert("RGB")) for img in images])
+            return self._run(self.prep(tensors))
         if self.model_name.startswith("animetimm"):
             return animetimm_tag_batch(self.sess, images, self.preprocess)
         if self.model_name.startswith("pixai"):
@@ -515,9 +569,20 @@ class ModelSpec:
         return wd_tag_batch(self.sess, images)
 
     def _run(self, arr):
+        if self.run_mode == "torch":
+            device = next(self.sess.parameters()).device
+            autocast = torch.autocast("cuda", dtype=torch.bfloat16) \
+                if device.type == "cuda" and torch.cuda.is_bf16_supported() else nullcontext()
+            with torch.inference_mode(), autocast:
+                logits = self.sess(arr.to(device))
+                return logits.float().sigmoid().cpu().numpy()
         outs = self.sess.run(self.out_names, {self.in_name: arr})
         if self.run_mode == "camie":
             return outs[1]                      # the "refine" head
+        if self.model_name.startswith("pixai"):
+            # Pixai also returns a 1024-wide embedding and raw logits. The
+            # prediction output contains probabilities in selected_tags order.
+            return outs[self.out_names.index("prediction")]
         if self.run_mode == "animetimm":
             widest = max(range(len(outs)), key=lambda i: outs[i].shape[-1])
             logits = outs[widest]
@@ -530,6 +595,8 @@ def _build_spec(sess: InferenceSession, tagger_info) -> ModelSpec:
     """Bind a session to its family's preprocessing and tag tables."""
     df, model_name = tagger_info[0], tagger_info[1]
     preprocess = tagger_info[2] if len(tagger_info) > 2 else None
+    if model_name == "pixai-tagger-v1.0":
+        return ModelSpec(sess, df, model_name, None, _prep_pixai_v1, "torch")
     layout, height, width = _find_input_layout(sess.get_inputs()[0].shape)
 
     if model_name.startswith("animetimm"):
@@ -561,6 +628,11 @@ def _escape(tag: str) -> str:
     return tag.replace("(", "\\(").replace(")", "\\)")
 
 
+def _normalize_excluded_tag(tag: str) -> str:
+    """Match raw names and prompt-formatted names the same way."""
+    return re.sub(r"\\+([()])", r"\1", tag).replace("_", " ").strip().casefold()
+
+
 def _format_tags(tag_list, trailing_comma=False):
     if not tag_list:
         return ""
@@ -568,81 +640,64 @@ def _format_tags(tag_list, trailing_comma=False):
     return res
 
 
-def _pick_top_rating(df):
-    """Pick the single highest-probability tag from rating category (1)."""
-    rating_rows = df[(df['category'] == 1) & (df['probs'] > 0)]
-    if rating_rows.empty:
-        return ""
-    top = rating_rows.loc[rating_rows['probs'].idxmax()]
-    return top['name']
+# Legacy numeric categories are retained for model metadata. Source category
+# names select recommendations and determine the output group.
 
 
-def _pick_top_rating_np(names, probs, idx_rating):
-    """Same as _pick_top_rating, on precomputed indices."""
-    if not len(idx_rating):
-        return ""
-    values = probs[idx_rating]
-    pos = values > 0
-    if not pos.any():
-        return ""
-    return names[idx_rating[np.argmax(np.where(pos, values, -np.inf))]]
-
-
-# Category convention for model loaders:
-#   0 = general (descriptive tags, shown in general_tags)
-#   1 = rating  (4 tags: safe/sensitive/questionable/explicit, shown in rating output)
-#   2 = quality (4 tags: best/normal/bad/worst, excluded from general/character)
-#   3 = meta    (metadata / model info, excluded from general/character)
-#   4 = character (character/copyright/artist, shown in character_tags)
-
-
-def get_tag(probs, tags_df: pd.DataFrame, spec=None, threshold=0.35, character_threshold=0.85,
-            use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags=""):
+def get_tag(probs, tags_df: pd.DataFrame, spec=None, threshold=0.0, character_threshold=0.0,
+            use_best_threshold=True, trailing_comma=False, sort_tags=False, exclude_tags="",
+            model_name=None):
     """Select tags for one image.
 
-    `spec` carries the indices/names precomputed at load time. It is optional so
-    callers (and tests) can still pass a plain DataFrame and get the original
-    pandas behaviour.
+    `spec` carries the indices/names precomputed at load time. Without one,
+    the same selection can run directly from a DataFrame.
     """
+    probs = np.asarray(probs)
     if spec is None:
-        df = tags_df.assign(probs=probs)
-        if sort_tags:
-            df = df.sort_values(by='probs', ascending=False)
-        if use_best_threshold and 'best_threshold' in df.columns:
-            best = df['best_threshold'].fillna(1.0)
-            general = df[(df['category'] == 0) & (df['probs'] >= np.maximum(best, threshold))]['name'].to_list()
-            character = df[(df['category'] == 4) & (df['probs'] >= np.maximum(best, character_threshold))]['name'].to_list()
-        else:
-            general = df[(df['category'] == 0) & (df['probs'] > threshold)]['name'].to_list()
-            character = df[(df['category'] == 4) & (df['probs'] > character_threshold)]['name'].to_list()
-        rating = _pick_top_rating(df)
-        general = [_escape(t) for t in general]
-        character = [_escape(t) for t in character]
+        names = tags_df["name"].to_numpy(dtype=object)
+        escaped = np.asarray([_escape(name) for name in names], dtype=object)
+        category_names = _category_names(tags_df)
+        recommendations = config["category_thresholds"].get(model_name, {})
+        groups = np.asarray(
+            [_category_group(name, recommendations) for name in category_names], dtype=object)
+        indices = {group: np.flatnonzero(groups == group)
+                   for group in ("general", "character", "rating")}
+        recommended = np.asarray(
+            [recommendations.get(name, 0.0) for name in category_names], dtype=np.float32)
+        best = np.nan_to_num(tags_df["best_threshold"].to_numpy(dtype=np.float32),
+                             nan=0.0, posinf=1.0, neginf=0.0) \
+            if "best_threshold" in tags_df.columns else None
     else:
-        idx_general = spec.tags["general"]
-        idx_character = spec.tags["character"]
-        if use_best_threshold and spec.best_threshold is not None:
-            # NaN best_threshold becomes 1.0, so `np.maximum(best, user)` keeps
-            # the user's threshold in charge exactly like `fillna(1.0)` did.
-            general = idx_general[probs[idx_general] >= np.maximum(spec.best_threshold[idx_general], threshold)]
-            character = idx_character[probs[idx_character] >= np.maximum(spec.best_threshold[idx_character], character_threshold)]
-        else:
-            general = idx_general[probs[idx_general] >= threshold]
-            character = idx_character[probs[idx_character] >= character_threshold]
-        if sort_tags:
-            # numpy's argsort is ascending; the pandas path used ascending=False.
-            general = general[np.argsort(probs[general])[::-1]]
-            character = character[np.argsort(probs[character])[::-1]]
-        rating = _pick_top_rating_np(spec.raw_names, probs, spec.tags["rating"])
-        general = spec.escaped_names[general].tolist()
-        character = spec.escaped_names[character].tolist()
+        names, escaped, indices = spec.raw_names, spec.escaped_names, spec.tags
+        recommended = getattr(spec, "recommended_threshold", np.zeros(len(probs), dtype=np.float32))
+        best = spec.best_threshold
 
-    remove = [s.strip() for s in exclude_tags.lower().split(",")] if exclude_tags else []
+    def select(group, floor):
+        idx = indices[group]
+        required = np.full(len(idx), floor, dtype=np.float32)
+        if use_best_threshold:
+            required = np.maximum(required, recommended[idx])
+            if best is not None:
+                required = np.maximum(required, best[idx])
+        selected = idx[probs[idx] >= required]
+        if sort_tags:
+            selected = selected[np.argsort(probs[selected], kind="stable")[::-1]]
+        return escaped[selected].tolist()
+
+    general = select("general", threshold)
+    character = select("character", character_threshold)
+    rating_idx = indices["rating"]
+    rating = ""
+    if len(rating_idx):
+        top = rating_idx[np.argmax(probs[rating_idx])]
+        if probs[top] > 0 and (not use_best_threshold or probs[top] >= recommended[top]):
+            rating = names[top]
+
+    remove = {_normalize_excluded_tag(s) for s in exclude_tags.split(",") if s.strip()}
     if remove:
         def _apply_exclude(tag_list):
-            # Escape for output, but match against the unescaped name.
-            return [_escape(t) for t in tag_list
-                    if t.replace("\\(", "(").replace("\\)", ")").lower() not in remove]
+            # Names are already escaped for output in both selection paths.
+            return [t for t in tag_list if _normalize_excluded_tag(t) not in remove]
         character = _apply_exclude(character)
         general = _apply_exclude(general)
 
@@ -690,6 +745,7 @@ async def download_model(model: str) -> None:
     model_path = config["model_path"].get(model, model + ".onnx")
     metadata_path = config["metadata_path"].get(model, "selected_tags.csv")
     external_data_path = config.get("external_data_path", {}).get(model)
+    code_path = config.get("code_path", {}).get(model)
     dest_model_path = os.path.join(models_dir, model_path)
     dest_metadata_path = os.path.join(models_dir, metadata_path)
 
@@ -740,9 +796,17 @@ async def download_model(model: str) -> None:
                 await download_to_file(f"{url}/{remote_metadata_path}", dest_metadata_path,
                                        session=session, progress_cb=progress)
 
+            if code_path:
+                dest_code_path = os.path.join(models_dir, code_path)
+                if not os.path.exists(dest_code_path):
+                    os.makedirs(os.path.dirname(dest_code_path), exist_ok=True)
+                    log(f"Downloading model code to {dest_code_path}...", "INFO", True)
+                    await download_to_file(f"{url}/{os.path.basename(code_path)}", dest_code_path,
+                                           session=session, progress_cb=progress)
+
             # Only download preprocess.json if required (animetimm models)
             preprocess_path = config.get("preprocess_path", {}).get(model)
-            if preprocess_path:
+            if preprocess_path and model not in config.get("optional_preprocess", []):
                 dest_preprocess_path = os.path.join(models_dir, preprocess_path)
                 if not os.path.exists(dest_preprocess_path):
                     os.makedirs(os.path.dirname(dest_preprocess_path), exist_ok=True)
@@ -776,16 +840,21 @@ class BooruTagger(io.ComfyNode):
                 io.Custom("TAGGER_INFO").Input("tagger_info"),
                 io.Image.Input("image"),
                 io.Float.Input("threshold", min=0.0, max=1.0,
-                               step=0.05, default=defaults["threshold"]),
+                               step=0.05, default=0.0,
+                               tooltip="Optional minimum for general tags; 0 uses the model recommendation."),
                 io.Float.Input("character_threshold",
-                               min=0.0, max=1.0, step=0.05, default=defaults["character_threshold"]),
+                               min=0.0, max=1.0, step=0.05, default=0.0,
+                               tooltip="Optional minimum for character, copyright, and artist tags; 0 uses the model recommendation."),
                 io.Boolean.Input("use_best_threshold", default=True,
-                                 tooltip="Use AnimeTimm's per-tag best_threshold values as minimum thresholds."),
+                                 tooltip="Use model-recommended thresholds as minimums."),
                 io.Boolean.Input("trailing_comma",
-                                 default=defaults["trailing_comma"]),
-                io.Boolean.Input("sort_tags", default=False),
+                                 default=defaults["trailing_comma"],
+                                 tooltip="Add a comma after the last tag."),
+                io.Boolean.Input("sort_tags", default=False,
+                                 tooltip="Sort tags by confidence, highest first."),
                 io.String.Input(
-                    "exclude_tags", default=defaults["exclude_tags"], multiline=True),
+                    "exclude_tags", default=defaults["exclude_tags"], multiline=True,
+                    tooltip="Comma-separated tags to omit from the output."),
             ],
             outputs=[
                 io.String.Output("tags", is_output_list=True),
@@ -810,8 +879,11 @@ class BooruTagger(io.ComfyNode):
 
         # Models with a fixed batch of 1 must be run one image at a time; models
         # with a dynamic batch dim get the whole list in a single ONNX call.
-        batch_dim = tagger_model.get_inputs()[0].shape[0]
-        can_batch = not isinstance(batch_dim, int) or batch_dim != 1
+        if model_name == "pixai-tagger-v1.0":
+            can_batch = False  # 1008px PyTorch inference has a large memory footprint.
+        else:
+            batch_dim = tagger_model.get_inputs()[0].shape[0]
+            can_batch = not isinstance(batch_dim, int) or batch_dim != 1
         total = image.shape[0]
         chunk = total if can_batch else 1
 
@@ -825,6 +897,11 @@ class BooruTagger(io.ComfyNode):
                 rows = spec.prepare_pil_batch(images)
             else:
                 rows = spec.prepare_batch(image[start:stop])
+            if rows.shape != (stop - start, len(tags_df)):
+                raise ValueError(
+                    f"{model_name} returned scores with shape {rows.shape}, but its tag metadata "
+                    f"contains {len(tags_df)} tags; check that the model and metadata match."
+                )
             probs[start:stop] = rows
             pbar.update(stop - start)
 
@@ -848,9 +925,11 @@ class LoadBooruTaggerModel(io.ComfyNode):
             category="BooruTagger",
             inputs=[
                 io.Combo.Input("model_name", options=models,
-                               default=defaults["model"]),
+                               default=defaults["model"],
+                               tooltip="Select a tagger model; missing files download automatically."),
                 io.Boolean.Input("replace_underscore",
-                                 default=defaults["replace_underscore"]),
+                                 default=defaults["replace_underscore"],
+                                 tooltip="Replace underscores in tag names with spaces."),
             ],
             outputs=[
                 io.Custom("TAGGER_MODEL").Output("tagger_model"),
@@ -882,17 +961,47 @@ class LoadBooruTaggerModel(io.ComfyNode):
         if external_data_path and not os.path.exists(os.path.join(models_dir, external_data_path)):
             needs_download = True
         preprocess_path = config.get("preprocess_path", {}).get(model_name)
-        if preprocess_path and not os.path.exists(os.path.join(models_dir, preprocess_path)):
+        if (preprocess_path and model_name not in config.get("optional_preprocess", [])
+                and not os.path.exists(os.path.join(models_dir, preprocess_path))):
+            needs_download = True
+        code_path = config.get("code_path", {}).get(model_name)
+        if code_path and not os.path.exists(os.path.join(models_dir, code_path)):
             needs_download = True
         if needs_download:
             await download_model(model_name)
 
+        threshold = config["threshold"].get(model_name, defaults["threshold"])
+        character_threshold = config["character_threshold"].get(model_name, defaults["character_threshold"])
+
+        if model_name == "pixai-tagger-v1.0":
+            from transformers import AutoModel
+            with open(meta_path, encoding="utf-8") as f:
+                metadata = json.load(f)
+            tags = metadata["tags"]
+            categories = []
+            best_thresholds = []
+            category_map = {"general": 0, "style": 0, "meta": 0,
+                            "character": 4, "copyright": 4, "rating": 1}
+            for category, count in metadata["tags_split"]:
+                categories.extend([category_map[category]] * count)
+                best_thresholds.extend([metadata["category_best_threshold"][category]] * count)
+            if len(tags) != len(categories):
+                raise ValueError(f"{model_name}: config.json tags and tags_split have different lengths")
+            category_names = [category for category, count in metadata["tags_split"]
+                              for _ in range(count)]
+            df = pd.DataFrame({"name": tags, "category": categories,
+                               "category_name": category_names,
+                               "best_threshold": best_thresholds})
+            if replace_underscore:
+                df["name"] = df["name"].str.replace("_", " ", regex=False)
+            model = AutoModel.from_pretrained(
+                os.path.dirname(name), trust_remote_code=True, local_files_only=True)
+            model = model.eval().to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+            return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
+
         sess_options = onnxruntime.SessionOptions()
         sess_options.log_severity_level = 3  # Suppress provider init warnings
         model = InferenceSession(name, sess_options=sess_options, providers=defaults["ortProviders"])
-
-        threshold = config["threshold"].get(model_name, defaults["threshold"])
-        character_threshold = config["character_threshold"].get(model_name, defaults["character_threshold"])
 
         # Validate that metadata actually exists after the download step
         if not os.path.exists(meta_path):
@@ -914,8 +1023,9 @@ class LoadBooruTaggerModel(io.ComfyNode):
                 js = json.load(f)
                 tag_mapping = js["dataset_info"]["tag_mapping"]
                 df["name"] = list(tag_mapping["idx_to_tag"].values())
-                df["category_name"] = list(
-                    tag_mapping["tag_to_category"].values())
+                df["category_name"] = [
+                    tag_mapping["tag_to_category"].get(name, "general")
+                    for name in df["name"]]
                 _cat_map_camie = {
                     "general": 0, "rating": 1,
                     "meta": 3, "year": 3,
@@ -952,14 +1062,17 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
                 tag_names = []
                 tag_cats = []
+                tag_category_names = []
                 for idx_str in sorted(idx_to_tag.keys(), key=int):
                     tag_name = idx_to_tag[idx_str]
                     category = tag_to_category.get(tag_name, "").lower()
                     tag_names.append(tag_name)
                     tag_cats.append(_cat_map_v1.get(category, 0))
+                    tag_category_names.append(category or "general")
 
                 df["name"] = tag_names
                 df["category"] = tag_cats
+                df["category_name"] = tag_category_names
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)
@@ -980,14 +1093,17 @@ class LoadBooruTaggerModel(io.ComfyNode):
 
                 tag_names = []
                 tag_cats = []
+                tag_category_names = []
                 for idx_str in sorted(idx_to_tag.keys(), key=int):
                     tag_name = idx_to_tag[idx_str]
                     category = tag_to_category.get(tag_name, "").lower()
                     tag_names.append(tag_name)
                     tag_cats.append(_cat_map_v2.get(category, 0))
+                    tag_category_names.append(category or "general")
 
                 df["name"] = tag_names
                 df["category"] = tag_cats
+                df["category_name"] = tag_category_names
             if replace_underscore:
                 df["name"] = df["name"].str.replace("_", " ")
             return io.NodeOutput(model, (df, model_name), threshold, character_threshold)

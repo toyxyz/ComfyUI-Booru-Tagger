@@ -1,5 +1,8 @@
 # Mirrors the [project].dependencies in pyproject.toml (the source of truth
 # used by the Comfy registry). Keep the two in sync.
 pandas
+transformers>=4.57.6
+timm
+safetensors
 onnxruntime-gpu; sys_platform != 'darwin'
 onnxruntime; sys_platform == 'darwin'
